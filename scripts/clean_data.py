@@ -1,29 +1,15 @@
-"""
-Оптимизированное создание Chroma DB с сохранением исправленного текста
-"""
-
 import os
 import pandas as pd
 from tqdm import tqdm
 import re
-import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 # === Настройки ===
-MODEL_NAME = "ai-forever/ru-en-RoSBERTa"
-DB_DIR = "chroma_db"
-INPUT_CSV = "data/websites_updated.csv"
-OUTPUT_CLEANED_CSV = "data_clean/websites_cleaned.csv"  # Новый файл с очищенными текстами
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 150
-MAX_WORKERS = 2
+INPUT_CSV = "../data/websites_updated.csv"
+OUTPUT_CLEANED_CSV = "../data_clean/websites_cleaned.csv"
+MAX_WORKERS = 4  # Количество потоков для обработки
 
 
 # === Быстрая нейросетевая модель для нормализации ===
@@ -84,7 +70,7 @@ class FastTextNormalizer:
         text = re.sub(r'[\u2022\u25CF\uf0a7•◆◇▶▪▫★☆✔✳❖\-\*\+]+', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
 
-        return text if len(text) > 10 else ""
+        return text
 
 
 class AdvancedTextCleaner:
@@ -96,25 +82,30 @@ class AdvancedTextCleaner:
             'см.': 'смотри', 'напр.': 'например', 'стр.': 'страница',
         }
 
-    def clean_text_advanced(self, text):
+    def clean_text_advanced(self, text, is_title=False):
         """Гибридная очистка: быстрая нейросеть + правила"""
         if not isinstance(text, str) or not text.strip():
             return ""
 
-        original_text = text
-
-        # Используем нейросеть для сложных случаев
-        if self.normalizer and len(text) > 50 and len(text) < 1000:
-            cleaned = self.normalizer.normalize_with_nn(text)
+        # Для title убираем ограничение по длине
+        if is_title:
+            # Используем нейросеть для title независимо от длины
+            if self.normalizer:
+                cleaned = self.normalizer.normalize_with_nn(text)
+            else:
+                cleaned = self.fast_clean(text)
         else:
-            cleaned = self.normalizer.fallback_clean(text) if self.normalizer else self.fast_clean(text)
+            # Для обычного текста сохраняем ограничения
+            if self.normalizer and len(text) > 50 and len(text) < 1000:
+                cleaned = self.normalizer.normalize_with_nn(text)
+            else:
+                cleaned = self.normalizer.fallback_clean(text) if self.normalizer else self.fast_clean(text)
 
         # Дополнительная rule-based очистка
         cleaned = self.fast_clean(cleaned)
 
-        # Возвращаем оригинал и очищенный текст
-        result = cleaned if len(cleaned) > 15 else ""
-        return result, original_text
+        # Для title возвращаем любой результат, для текста - только если длиннее 15 символов
+        return cleaned if (is_title or len(cleaned) > 15) else ""
 
     def fast_clean(self, text):
         """Быстрая rule-based очистка"""
@@ -126,34 +117,21 @@ class AdvancedTextCleaner:
         return text
 
 
-def process_document_row(row, cleaner, splitter):
-    """Обработка одной строки документа с сохранением оригинального текста"""
+def process_document_row(row, cleaner):
+    """Обработка одной строки документа"""
     text = str(row.get("text", "") or "")
     title = str(row.get("title", "") or "")
 
-    # Очистка текста с сохранением оригинала
-    cleaned_text, original_text = cleaner.clean_text_advanced(text)
-    cleaned_title, original_title = cleaner.clean_text_advanced(title)
-
-    if not cleaned_text:
-        return []
+    # Очистка текста (для title снимаем ограничения по длине)
+    cleaned_text = cleaner.clean_text_advanced(text, is_title=False)
+    cleaned_title = cleaner.clean_text_advanced(title, is_title=True)
 
     # Подготовка данных для сохранения
     row_data = row.to_dict()
-    row_data['original_text'] = original_text
     row_data['cleaned_text'] = cleaned_text
-    row_data['original_title'] = original_title
     row_data['cleaned_title'] = cleaned_title
 
-    # Разбиение на чанки если нужно
-    if len(cleaned_text) > CHUNK_SIZE:
-        try:
-            chunks = splitter.split_text(cleaned_text)
-            return [(chunk, cleaned_title, row_data) for chunk in chunks if chunk.strip()]
-        except Exception:
-            return [(cleaned_text, cleaned_title, row_data)]
-    else:
-        return [(cleaned_text, cleaned_title, row_data)]
+    return row_data
 
 
 def main():
@@ -161,32 +139,23 @@ def main():
     df = pd.read_csv(INPUT_CSV)
     print(f"Загружено {len(df)} страниц")
 
-    # Инициализация компонентов
+    # Инициализация очистителя
     cleaner = AdvancedTextCleaner(use_nn=True)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        length_function=len,
-    )
 
     # Параллельная обработка
     print("Обработка документов...")
-    all_docs = []
-    all_cleaned_data = []  # Для сохранения очищенных данных
+    all_cleaned_data = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for _, row in df.iterrows():
-            future = executor.submit(process_document_row, row, cleaner, splitter)
+            future = executor.submit(process_document_row, row, cleaner)
             futures.append(future)
 
         for future in tqdm(as_completed(futures), total=len(futures), desc="Обработка"):
             try:
                 result = future.result()
-                all_docs.extend(result)
-                # Сохраняем данные для CSV (берем первый чанк как представитель)
-                if result:
-                    all_cleaned_data.append(result[0][2])  # row_data из первого чанка
+                all_cleaned_data.append(result)
             except Exception as e:
                 print(f"Ошибка обработки: {e}")
 
@@ -194,63 +163,26 @@ def main():
     print("Сохранение очищенных данных...")
     if all_cleaned_data:
         cleaned_df = pd.DataFrame(all_cleaned_data)
+
         # Сохраняем только нужные колонки
-        output_columns = ['web_id', 'url', 'kind', 'original_title', 'cleaned_title', 'original_text', 'cleaned_text']
+        output_columns = ['web_id', 'url', 'kind', 'cleaned_title', 'cleaned_text']
+
+        # Выбираем только существующие колонки
         available_columns = [col for col in output_columns if col in cleaned_df.columns]
+
+        # Добавляем остальные колонки из исходных данных (кроме оригинальных текстов)
+        for col in df.columns:
+            if col not in available_columns and col in cleaned_df.columns and col not in ['text', 'title']:
+                available_columns.append(col)
+
         cleaned_df[available_columns].to_csv(OUTPUT_CLEANED_CSV, index=False, encoding='utf-8')
         print(f"Очищенные данные сохранены в {OUTPUT_CLEANED_CSV}")
-
-    # Подготовка документов для Chroma
-    print("Подготовка документов для векторной БД...")
-    chroma_docs = []
-    doc_ids = []
-
-    for i, (content, title, row_data) in enumerate(all_docs):
-        if not content:
-            continue
-
-        doc_id = hashlib.md5(f"{row_data['web_id']}_{i}".encode()).hexdigest()
-
-        chroma_docs.append(
-            Document(
-                page_content=content,
-                metadata={
-                    "web_id": row_data.get("web_id"),
-                    "title": title,
-                    "url": row_data.get("url"),
-                    "kind": row_data.get("kind"),
-                    "chunk_id": i,
-                }
-            )
-        )
-        doc_ids.append(doc_id)
-
-    print(f"Создано {len(chroma_docs)} чанков")
-
-    if not chroma_docs:
-        print("Нет документов для создания базы")
-        return
-
-    # Создание векторной базы
-    print("Создание Chroma DB...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name=MODEL_NAME,
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
-
-    db = Chroma.from_documents(
-        documents=chroma_docs,
-        embedding=embeddings,
-        persist_directory=DB_DIR,
-        ids=doc_ids
-    )
-    db.persist()
-
-    print(f"Chroma DB создана в {DB_DIR}")
-    print(f"Статистика: {len(df)} -> {len(chroma_docs)} чанков")
-    print(f"Очищенные данные: {OUTPUT_CLEANED_CSV}")
+        print(f"Обработано записей: {len(all_cleaned_data)}")
+    else:
+        print("Нет данных для сохранения")
 
 
 if __name__ == "__main__":
+    # Создаем папку для результатов если её нет
+    os.makedirs(os.path.dirname(OUTPUT_CLEANED_CSV), exist_ok=True)
     main()
